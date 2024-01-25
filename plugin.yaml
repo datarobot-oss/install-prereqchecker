@@ -2,7 +2,7 @@ sonobuoy-config:
   driver: Job
   plugin-name: datarobot-conformance
   result-format: gojson
-  source_url: https://raw.githubusercontent.com/datarobot/environment-conformance-checker/main/plugin.yaml
+  source_url: https://raw.githubusercontent.com/datarobot/install-prereqchecker/main/plugin.yaml
   description: Tool for checking installation environment for DataRobot conformance
 spec:
   command:
@@ -11,7 +11,7 @@ spec:
   image: datarobotdev/install-prereqchecker:latest
   env:
     - name: MIN_K8S_VERSION
-      value: 1.23
+      value: "1.23"
     - name: NS_PREFIX
       value: dr-sonobuyo
     - name: SONOBUOY_PROGRESS_PORT
