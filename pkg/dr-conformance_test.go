@@ -78,7 +78,7 @@ func TestNetwork(t *testing.T) {
 		Assess("ingress correctly configured", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			ingressExternalLBURL, err := getDefaultIngressExternalLBURL(cfg.Client().Resources())
 			if err != nil {
-				t.Fatalf("Failed to get default ingress cluster IP: %v", err)
+				t.Fatalf("Failed to get default ingress external LoadBalancer IP: %v", err)
 			}
 			err = checkConnectionToRootRoute(&ingressExternalLBURL)
 			if err != nil {
@@ -127,10 +127,20 @@ func getDefaultIngressExternalLBURL(r *resources.Resources) (string, error) {
 		err := fmt.Errorf("no default ingress classes defined")
 		return "", err
 	}
-	ingService, err := fuzzyFindService(r, defaultIngClass)
+	candidateIngServices, err := fuzzyFindServices(r, defaultIngClass)
 	if err != nil {
 		return "", err
 	}
+	candidateIngServicesWithLB := filter(candidateIngServices, func(s *corev1.Service) bool {
+		return s.Spec.Type == "LoadBalancer"
+	})
+	if candidateIngServicesWithLB == nil || len(candidateIngServicesWithLB) == 0 {
+		err = fmt.Errorf("Can not find suitable Ingress Controller services for ingress class %s, found the following candidates: %v",
+			defaultIngClass.Name, candidateIngServices)
+		return "", err
+	}
+	ingService := candidateIngServicesWithLB[0] //TODO: should we check all?
+
 	if ingService.Spec.Type != "LoadBalancer" ||
 		len(ingService.Status.LoadBalancer.Ingress) == 0 ||
 		len(firstNonEmpty(ingService.Status.LoadBalancer.Ingress[0].IP, ingService.Status.LoadBalancer.Ingress[0].Hostname)) == 0 {
@@ -168,25 +178,24 @@ func isDefault(ingClass v12.IngressClass) bool {
 	//ingClass.Annotations["ingressclass.kubernetes.io/is-default-class"] == "true"
 }
 
-func fuzzyFindService(r *resources.Resources, defaultIngClass *v12.IngressClass) (*corev1.Service, error) {
+func fuzzyFindServices(r *resources.Resources, defaultIngClass *v12.IngressClass) ([]*corev1.Service, error) {
+	var res []*corev1.Service
 	svcList := corev1.ServiceList{}
 	err := r.List(context.TODO(), &svcList)
 	fuzzyIngName := defaultIngClass.Name
 	if err != nil {
 		return nil, err
 	}
-	var ingService *corev1.Service = nil
 	for _, svc := range svcList.Items {
 		if strings.Contains(svc.Labels["app.kubernetes.io/name"], fuzzyIngName) {
-			ingService = &svc
-			break
+			res = append(res, svc.DeepCopy())
 		}
 	}
-	if ingService == nil {
+	if res == nil || len(res) == 0 {
 		err := fmt.Errorf("No Service for IngressClass %s found", defaultIngClass.Name)
 		return nil, err
 	}
-	return ingService, nil
+	return res, nil
 }
 
 func testNetworkCapacityOnPrem(c klient.Client) error {
