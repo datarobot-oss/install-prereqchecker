@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-REGISTRY=datarobotdev
+REGISTRY=datarobot
 IMG=install-prereqchecker
 TAG=latest
 

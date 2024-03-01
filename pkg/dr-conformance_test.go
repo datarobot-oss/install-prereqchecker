@@ -152,11 +152,11 @@ func getDefaultIngressExternalLBURL(r *resources.Resources) (string, error) {
 	tcpPorts := filter(ingService.Spec.Ports, func(port corev1.ServicePort) bool {
 		return port.Protocol == corev1.ProtocolTCP
 	})
-	httpsPorts := filter(tcpPorts, func(port corev1.ServicePort) bool {
-		return strings.ToLower(port.Name) == "https" || port.Port == 443
+	httpPorts := filter(tcpPorts, func(port corev1.ServicePort) bool {
+		return strings.ToLower(port.Name) == "http" || port.Port == 80
 	})
-	if len(httpsPorts) > 0 {
-		address = fmt.Sprintf("https://%s:%d", address, httpsPorts[0].Port)
+	if len(httpPorts) > 0 {
+		address = fmt.Sprintf("http://%s:%d", address, httpPorts[0].Port)
 	} else if len(tcpPorts) != 0 {
 		address = fmt.Sprintf("http://%s:%d", address, tcpPorts[0].Port)
 	}
