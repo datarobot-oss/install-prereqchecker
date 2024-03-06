@@ -52,7 +52,7 @@ const BYTES_IN_GB = 1024 * 1024 * 1024
 
 const (
 	minimumRequiredK8sVersionDefault = "1.23" //TODO pass as an env var
-	datarobotTotalPods               = 80
+	datarobotTotalPods               = 90
 	datarobotTotalServices           = 50
 )
 
