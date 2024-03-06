@@ -37,7 +37,7 @@ The default is `on-prem`.
 for available options: See https://github.com/datarobot/install-prereqchecker/blob/main/pkg/main_test.go for the latest options.
 
 ```
-sonobuoy run --plugin "https://raw.githubusercontent.com/datarobot/install-prereqchecker/main/plugin.yaml --plugin-env datarobot-conformance.CLUSTER_NAME=<your-cluster-name> --plugin-env datarobot-conformance.AWS_REGION=us-east-1  --force-image-pull-policy --image-pull-policy=Always --plugin-env datarobot-conformance.K8S_ENVIRONMENT=EKS
+sonobuoy run --plugin "https://raw.githubusercontent.com/datarobot/install-prereqchecker/main/plugin.yaml" --plugin-env datarobot-conformance.CLUSTER_NAME=<your-cluster-name> --plugin-env datarobot-conformance.AWS_REGION=us-east-1  --force-image-pull-policy --image-pull-policy=Always --plugin-env datarobot-conformance.K8S_ENVIRONMENT=EKS
 ```
 Watch it
 ```
