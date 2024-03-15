@@ -1,5 +1,5 @@
 /*
-   Copyright 2021 The Kubernetes Authors.
+   Copyright 2024 the DataRoot team.
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at
@@ -23,8 +23,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-version"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	v12 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,6 +58,8 @@ const (
 	datarobotTotalServices           = 50
 )
 
+var upgrader = websocket.Upgrader{}
+
 func TestNetwork(t *testing.T) {
 	if !isTestApplicable(EKS) {
 		return
@@ -85,9 +89,71 @@ func TestNetwork(t *testing.T) {
 				t.Fatalf("Can't connect to default ingress cluster IP: %v", err)
 			}
 			return ctx
+		}).
+		Assess("websockets are allowed through ingress", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			wsURL, err := setupWsURL(cfg.Client().Resources(), ctx.Value(nsKey(t)).(string))
+			if err != nil {
+				t.Fatalf("Can't setup necessary infra for testing websockets: %v", err)
+			}
+			ingressExternalLBURL, err := getDefaultIngressExternalLBURL(cfg.Client().Resources())
+			if err != nil {
+				t.Fatalf("Failed to get default ingress external LoadBalancer IP: %v", err)
+			}
+			externalWsURL := strings.Replace(fmt.Sprintf("%s%s", ingressExternalLBURL, *wsURL), "http", "ws", 1)
+			if err := testWSConnection(err, &externalWsURL, t); err != nil {
+				t.Fatalf("Failed connecting to websocket server: %v", err)
+			}
+			return ctx
 		})
 
 	testenv.Test(t, f.Feature())
+}
+
+func testWSConnection(err error, wsURL *string, t *testing.T) error {
+	// Connect to the server
+	ws, _, err := websocket.DefaultDialer.Dial(*wsURL, nil)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	defer ws.Close()
+
+	//read first message which is usually "Request served by websocket-server"
+	_, _, err = ws.ReadMessage()
+	if err != nil {
+		return err
+	}
+	// Send message to server, read response and check to see if it's what we expect.
+	for i := 0; i < 10; i++ {
+		if err := ws.WriteMessage(websocket.TextMessage, []byte("hello")); err != nil {
+			return err
+		}
+		_, p, err := ws.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if string(p) != "hello" {
+			return fmt.Errorf("bad message received from WS server: %v", string(p))
+		}
+	}
+	return nil
+}
+
+func echo(w http.ResponseWriter, r *http.Request) {
+	c, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	for {
+		mt, message, err := c.ReadMessage()
+		if err != nil {
+			break
+		}
+		err = c.WriteMessage(mt, message)
+		if err != nil {
+			break
+		}
+	}
 }
 
 func checkConnectionToRootRoute(rootUrl *string) error {
@@ -173,8 +239,10 @@ func firstNonEmpty(args ...string) string {
 }
 
 func isDefault(ingClass v12.IngressClass) bool {
-	return ingClass.Spec.Parameters == nil || (ingClass.Spec.Parameters.Namespace == nil ||
-		*ingClass.Spec.Parameters.Namespace == "default") //&&
+	return ingClass.Name == "nginx" //TODO: remove me after we get rid of nginx
+
+	/*ingClass.Spec.Parameters == nil || (ingClass.Spec.Parameters.Namespace == nil ||
+	*ingClass.Spec.Parameters.Namespace == "default")*/ //&&
 	//ingClass.Annotations["ingressclass.kubernetes.io/is-default-class"] == "true"
 }
 
@@ -461,7 +529,7 @@ func TestClusterHasEnoughResourcesByPodCreation(t *testing.T) {
 			r := cfg.Client().Resources()
 			pods := make([]corev1.Pod, numPods)
 			for i := 0; i < numPods; i++ {
-				pod, err := createPod(r, rndString(5), ctx.Value(nsKey(t)).(string), podRamGB, float32(podCPUCores))
+				pod, err := createDefaultPod(r, rndString(5), ctx.Value(nsKey(t)).(string), podRamGB, float32(podCPUCores))
 				if err != nil {
 					t.Error(err)
 				}
@@ -490,6 +558,10 @@ func TestClusterHasEnoughResourcesByPodCreation(t *testing.T) {
 	testenv.Test(t, f.Feature())
 }
 
+func createDefaultPod(r *resources.Resources, name string, namespace string, podRamGB float32, podCPUCores float32) (*corev1.Pod, error) {
+	return createPod(r, "busybox", name, namespace, []string{"sleep", "3600"}, podRamGB, podCPUCores)
+}
+
 func rndString(n int) string {
 	rand.Seed(time.Now().UnixNano())
 	p := make([]byte, n)
@@ -512,19 +584,128 @@ func isPodPendingInsufficientResources(pod *corev1.Pod) bool {
 	return false
 }
 
-func createPod(r *resources.Resources, name string, namespace string, podRamGB float32, podCPUCores float32) (*corev1.Pod, error) {
+func setupWsURL(r *resources.Resources, namespace string) (*string, error) {
+	port := int32(8080)
+	pod, err := createPodSync(r, "jmalloc/echo-server", "websocket-server", namespace, nil, 0.1, 0.1)
+	if err != nil {
+		return nil, err
+	}
+	service, err := createService(r, pod, port)
+	if err != nil {
+		return nil, err
+	}
+	ingress, err := createIngressRouteForServiceSync(r, service, port)
+	if err != nil {
+		return nil, err
+	}
+	return &ingress.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Path, nil
+}
+func createService(r *resources.Resources, p *corev1.Pod, port int32) (*corev1.Service, error) {
+	service := &corev1.Service{
+		ObjectMeta: v1.ObjectMeta{
+			Name:        p.Name,
+			Namespace:   p.Namespace,
+			Annotations: map[string]string{"nginx.org/websocket-services": p.Name},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: p.ObjectMeta.Labels,
+		},
+	}
+	service.Spec.Ports = []corev1.ServicePort{
+		{
+			Name:     fmt.Sprintf("service-port-tcp-%d", port),
+			Protocol: corev1.ProtocolTCP,
+			Port:     port,
+		},
+	}
+	err := r.Create(context.TODO(), service)
+	if err != nil {
+		return nil, err
+	}
+	return service, nil
+}
+
+func createIngressRouteForServiceSync(r *resources.Resources, s *corev1.Service, port int32) (*networkingv1.Ingress, error) {
+	var pathTypeExact = networkingv1.PathTypeExact
+	var ingressClassName = "nginx"
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: v1.ObjectMeta{
+			Namespace: s.Namespace,
+			Name:      fmt.Sprintf("%s-ingress", s.Name),
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: &ingressClassName, //TODO: remove me when we get rid of nginx requirement
+			Rules: []networkingv1.IngressRule{
+				{
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									Path:     fmt.Sprintf("/install-prereqchecker/%s", s.Name),
+									PathType: &pathTypeExact,
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: s.Name,
+											Port: networkingv1.ServiceBackendPort{
+												Number: port,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	err := r.Create(context.TODO(), ingress)
+	if err != nil {
+		return nil, fmt.Errorf("error creating ingress: %v", err)
+	}
+	err = wait.For(conditions.New(r).ResourcesMatch(
+		&networkingv1.IngressList{Items: []networkingv1.Ingress{*ingress}},
+		func(object k8s.Object) bool {
+			ingress := object.(*networkingv1.Ingress)
+			return len(ingress.Status.LoadBalancer.Ingress) > 0 &&
+				len(firstNonEmpty(ingress.Status.LoadBalancer.Ingress[0].IP, ingress.Status.LoadBalancer.Ingress[0].Hostname)) > 0
+		}), wait.WithImmediate(), wait.WithTimeout(5*time.Minute))
+	if err != nil {
+		return nil, err
+	}
+	return ingress, nil
+}
+
+func createPodSync(r *resources.Resources, image string, name string, namespace string, command []string,
+	podRamGB float32, podCPUCores float32) (*corev1.Pod, error) {
+
+	pod, err := createPod(r, image, name, namespace, command, podRamGB, podCPUCores)
+	if err != nil {
+		return nil, err
+	}
+	err = wait.For(conditions.New(r).PodRunning(pod),
+		wait.WithImmediate(), wait.WithTimeout(5*time.Minute))
+	if err != nil {
+		return nil, err
+	}
+	return pod, nil
+}
+
+func createPod(r *resources.Resources, image string, name string, namespace string, command []string,
+	podRamGB float32, podCPUCores float32) (*corev1.Pod, error) {
 	pod := &corev1.Pod{
 		TypeMeta: v1.TypeMeta{},
 		ObjectMeta: v1.ObjectMeta{
 			Namespace: namespace,
 			Name:      name,
+			Labels:    map[string]string{"app.kubernetes.io/name": name},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
 					Name:    name,
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
+					Image:   image,
+					Command: command,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse(fmt.Sprint(podCPUCores)),
