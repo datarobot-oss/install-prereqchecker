@@ -12,7 +12,7 @@ install-prereqchecker is a plugin for a third party app called Sonobuoywhich is 
 
 ### Mac
 ```
-brew install sonobuyo
+brew install sonobuoy
 ```
 
 ### Linux
