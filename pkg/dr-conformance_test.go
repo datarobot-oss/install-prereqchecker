@@ -17,6 +17,16 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log"
+	"math"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -32,12 +42,6 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/utils/env"
-	"log"
-	"math"
-	"math/rand"
-	"net/http"
-	"net/url"
-	"os"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
@@ -45,9 +49,6 @@ import (
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
-	"strings"
-	"testing"
-	"time"
 )
 
 const BYTES_IN_GB = 1024 * 1024 * 1024
@@ -103,6 +104,45 @@ func TestNetwork(t *testing.T) {
 			if err := testWSConnection(err, &externalWsURL, t); err != nil {
 				t.Fatalf("Failed connecting to websocket server: %v", err)
 			}
+			return ctx
+		}).
+		Assess("ingress controllers have required capability", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			var ingressRequirements = map[string]map[string]string{}
+			ingressRequirements["apigateway"] = map[string]string{
+				"nginx.ingress.kubernetes.io/proxy-body-size":    "1124M",
+				"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+			}
+			ingressRequirements["core"] = map[string]string{
+				"nginx.ingress.kubernetes.io/proxy-body-size":    "20G",
+				"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+			}
+			ingressRequirements["nbx-ingress"] = map[string]string{
+				"nginx.ingress.kubernetes.io/proxy-body-size": "1124M",
+			}
+			ingressRequirements["nbx-websocket"] = map[string]string{
+				"nginx.ingress.kubernetes.io/proxy-body-size":    "15m",
+				"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+			}
+
+			ingressItems, err := getAllIngressControllers(cfg.Client().Resources())
+			if err != nil {
+				t.Fatalf("Failed to get ingress controllers: %v", err)
+				return ctx
+			}
+
+			for _, ingItem := range *ingressItems {
+				annotations, exists := ingressRequirements[ingItem.Name]
+				if exists {
+					for annName, annotation := range ingItem.Annotations {
+						if val, ok := annotations[annName]; ok {
+							if val != annotation {
+								t.Fatalf("Ingress controller \"%s\" of \"%s\" has wrong annotation \"%s\", expected \"%s\", got \"%s\"", ingItem.Name, ingItem.Namespace, annName, val, annotation)
+							}
+						}
+					}
+				}
+			}
+
 			return ctx
 		})
 
@@ -167,6 +207,15 @@ func checkConnectionToRootRoute(rootUrl *string) error {
 		return fmt.Errorf("received bad status code %d from default ingress at URL %s", resp.StatusCode, *rootUrl)
 	}
 	return nil
+}
+
+func getAllIngressControllers(r *resources.Resources) (*[]v12.Ingress, error) {
+	ingressList := v12.IngressList{}
+	err := r.List(context.TODO(), &ingressList)
+	if err != nil {
+		return nil, err
+	}
+	return &ingressList.Items, nil
 }
 
 func getDefaultIngressExternalLBURL(r *resources.Resources) (string, error) {
