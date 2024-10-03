@@ -35,6 +35,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-version"
+
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	v12 "k8s.io/api/networking/v1"
@@ -130,13 +132,42 @@ func TestNetwork(t *testing.T) {
 				return ctx
 			}
 
-			for _, ingItem := range *ingressItems {
-				annotations, exists := ingressRequirements[ingItem.Name]
+			for _, ingressItem := range *ingressItems {
+				annotations, exists := ingressRequirements[ingressItem.Name]
 				if exists {
-					for annName, annotation := range ingItem.Annotations {
-						if val, ok := annotations[annName]; ok {
+					for annotationName, annotation := range ingressItem.Annotations {
+						if val, ok := annotations[annotationName]; ok {
 							if val != annotation {
-								t.Fatalf("Ingress controller \"%s\" of \"%s\" has wrong annotation \"%s\", expected \"%s\", got \"%s\"", ingItem.Name, ingItem.Namespace, annName, val, annotation)
+								t.Fatalf(
+									"Ingress controller \"%s\" of \"%s\" has wrong annotation \"%s\", expected \"%s\", got \"%s\"",
+									ingressItem.Name,
+									ingressItem.Namespace,
+									annotationName,
+									val,
+									annotation,
+								)
+							}
+						}
+					}
+
+					// Check sticky sessions for nbx-websocket
+					if ingressItem.Name == "nbx-websocket" {
+						deploymentItem, depErr := getDeployment(
+							cfg.Client().Resources(),
+							"nbx-websocket-notebooks-deployment",
+							ingressItem.Namespace,
+						)
+						if depErr != nil {
+							t.Fatalf("Failed to get the deployment: %v", depErr)
+							return ctx
+						}
+						if int(*deploymentItem.Spec.Replicas) > 1 {
+							if _, ok := ingressItem.Annotations["nginx.ingress.kubernetes.io/session-cookie-name"]; !ok {
+								t.Fatalf(
+									"Ingress controller \"%s\" of \"%s\" does not have session \"session-cookie-name\" annotation",
+									ingressItem.Name,
+									ingressItem.Namespace,
+								)
 							}
 						}
 					}
@@ -216,6 +247,25 @@ func getAllIngressControllers(r *resources.Resources) (*[]v12.Ingress, error) {
 		return nil, err
 	}
 	return &ingressList.Items, nil
+}
+
+func getDeployment(r *resources.Resources, name string, namespace string) (*appsv1.Deployment, error) {
+	deploymentList := appsv1.DeploymentList{}
+	t := resources.ListOption(func(opts *v1.ListOptions) {
+		opts.LabelSelector = fmt.Sprintf("app.kubernetes.io/name=%s", name)
+		opts.FieldSelector = fmt.Sprintf("metadata.namespace=%s", namespace)
+	})
+	err := r.List(context.TODO(), &deploymentList, t)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(deploymentList.Items) == 0 {
+		err := fmt.Errorf("no deployments found")
+		return nil, err
+	}
+
+	return &deploymentList.Items[0], nil
 }
 
 func getDefaultIngressExternalLBURL(r *resources.Resources) (string, error) {
