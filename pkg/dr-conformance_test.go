@@ -175,6 +175,40 @@ func TestNetwork(t *testing.T) {
 			}
 
 			return ctx
+		}).
+		Assess("cert-manager deployment has been installed and configured", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+
+			// Check if cert-manager deployment is running
+			certManagerDeployment, err := getDeployment(cfg.Client().Resources(), "cert-manager", "cert-manager")
+			if err != nil {
+				t.Fatalf("Failed to get cert-manager deployment: %v", err)
+			}
+			err = checkCertManagerDeployment(certManagerDeployment)
+			if err != nil {
+				t.Fatalf("The cert-manager deployment is not ready: %v", err)
+			}
+
+			// Check if cert-manager-cainjector deployment is running
+			certManagerCainjectorDeployment, err := getDeployment(cfg.Client().Resources(), "cert-manager-cainjector", "cert-manager")
+			if err != nil {
+				t.Fatalf("Failed to get cert-manager-cainjector deployment: %v", err)
+			}
+			err = checkCertManagerDeployment(certManagerCainjectorDeployment)
+			if err != nil {
+				t.Fatalf("The cert-manager-cainjector deployment is not ready: %v", err)
+			}
+
+			// Check if cert-manager-webhook is running
+			certManagerWebhook, err := getDeployment(cfg.Client().Resources(), "cert-manager-webhook", "cert-manager")
+			if err != nil {
+				t.Fatalf("Failed to get cert-manager-webhook deployment: %v", err)
+			}
+			err = checkCertManagerDeployment(certManagerWebhook)
+			if err != nil {
+				t.Fatalf("The cert-manager-webhook deployment is not ready: %v", err)
+			}
+
+			return ctx
 		})
 
 	testenv.Test(t, f.Feature())
@@ -252,8 +286,7 @@ func getAllIngressControllers(r *resources.Resources) (*[]v12.Ingress, error) {
 func getDeployment(r *resources.Resources, name string, namespace string) (*appsv1.Deployment, error) {
 	deploymentList := appsv1.DeploymentList{}
 	t := resources.ListOption(func(opts *v1.ListOptions) {
-		opts.LabelSelector = fmt.Sprintf("app.kubernetes.io/name=%s", name)
-		opts.FieldSelector = fmt.Sprintf("metadata.namespace=%s", namespace)
+		opts.FieldSelector = fmt.Sprintf("metadata.name=%s,metadata.namespace=%s", name, namespace)
 	})
 	err := r.List(context.TODO(), &deploymentList, t)
 	if err != nil {
@@ -266,6 +299,30 @@ func getDeployment(r *resources.Resources, name string, namespace string) (*apps
 	}
 
 	return &deploymentList.Items[0], nil
+}
+
+func checkCertManagerDeployment(deployment *appsv1.Deployment) error {
+	conditions := deployment.Status.Conditions
+	failureConditions := filter(conditions, func(condition appsv1.DeploymentCondition) bool {
+		return condition.Type == appsv1.DeploymentReplicaFailure
+	})
+	if len(failureConditions) > 0 {
+		return fmt.Errorf("%s deployment has failed conditions: %v", deployment.Name, failureConditions)
+	}
+	availableConditions := filter(conditions, func(condition appsv1.DeploymentCondition) bool {
+		return condition.Type == appsv1.DeploymentAvailable
+	})
+	if len(availableConditions) == 0 {
+		return fmt.Errorf("%s deployment has not available conditions: %v", deployment.Name, availableConditions)
+	}
+	progressingConditions := filter(conditions, func(condition appsv1.DeploymentCondition) bool {
+		return condition.Type == appsv1.DeploymentProgressing
+	})
+	if len(progressingConditions) == 0 {
+		return fmt.Errorf("%s deployment has not progressing conditions: %v", deployment.Name, progressingConditions)
+	}
+
+	return nil
 }
 
 func getDefaultIngressExternalLBURL(r *resources.Resources) (string, error) {
