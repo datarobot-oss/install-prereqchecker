@@ -109,21 +109,54 @@ func TestNetwork(t *testing.T) {
 			return ctx
 		}).
 		Assess("ingress controllers have required capability", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			var ingressRequirements = map[string]map[string]string{}
-			ingressRequirements["apigateway"] = map[string]string{
-				"nginx.ingress.kubernetes.io/proxy-body-size":    "1124M",
-				"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+
+			// Ingress controllers requirements
+			var ingressRequirements = map[string]func(ingress v12.Ingress, annotations map[string]string) error{}
+			ingressRequirements["apigateway"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				return checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    "1124M",
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				})
 			}
-			ingressRequirements["core"] = map[string]string{
-				"nginx.ingress.kubernetes.io/proxy-body-size":    "20G",
-				"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+			ingressRequirements["core"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				return checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    "20G",
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				})
 			}
-			ingressRequirements["nbx-ingress"] = map[string]string{
-				"nginx.ingress.kubernetes.io/proxy-body-size": "1124M",
+			ingressRequirements["nbx-ingress"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				return checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				})
 			}
-			ingressRequirements["nbx-websocket"] = map[string]string{
-				"nginx.ingress.kubernetes.io/proxy-body-size":    "15m",
-				"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+			ingressRequirements["nbx-websocket"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				err := checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    "15m",
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+				})
+				if err != nil {
+					return err
+				}
+
+				// Check sticky sessions
+				deploymentItem, depErr := getDeployment(
+					cfg.Client().Resources(),
+					"nbx-websocket-notebooks-deployment",
+					ingress.Namespace,
+				)
+				if depErr != nil {
+					return fmt.Errorf("Failed to get the deployment: %v", depErr)
+				}
+				if int(*deploymentItem.Spec.Replicas) > 1 {
+					if _, ok := ingress.Annotations["nginx.ingress.kubernetes.io/session-cookie-name"]; !ok {
+						return fmt.Errorf(
+							"No defined sticky session with \"session-cookie-name\" annotation, but there are more than 1 replicas: %d",
+							*deploymentItem.Spec.Replicas,
+						)
+					}
+				}
+
+				return nil
 			}
 
 			ingressItems, err := getAllIngressControllers(cfg.Client().Resources())
@@ -133,49 +166,69 @@ func TestNetwork(t *testing.T) {
 			}
 
 			for _, ingressItem := range *ingressItems {
-				annotations, exists := ingressRequirements[ingressItem.Name]
+				handler, exists := ingressRequirements[ingressItem.Name]
 				if exists {
-					for annotationName, annotation := range ingressItem.Annotations {
-						if val, ok := annotations[annotationName]; ok {
-							if val != annotation {
-								t.Fatalf(
-									"Ingress controller \"%s\" of \"%s\" has wrong annotation \"%s\", expected \"%s\", got \"%s\"",
-									ingressItem.Name,
-									ingressItem.Namespace,
-									annotationName,
-									val,
-									annotation,
-								)
-							}
-						}
-					}
-
-					// Check sticky sessions for nbx-websocket
-					if ingressItem.Name == "nbx-websocket" {
-						deploymentItem, depErr := getDeployment(
-							cfg.Client().Resources(),
-							"nbx-websocket-notebooks-deployment",
-							ingressItem.Namespace,
-						)
-						if depErr != nil {
-							t.Fatalf("Failed to get the deployment: %v", depErr)
-							return ctx
-						}
-						if int(*deploymentItem.Spec.Replicas) > 1 {
-							if _, ok := ingressItem.Annotations["nginx.ingress.kubernetes.io/session-cookie-name"]; !ok {
-								t.Fatalf(
-									"Ingress controller \"%s\" of \"%s\" does not have session \"session-cookie-name\" annotation",
-									ingressItem.Name,
-									ingressItem.Namespace,
-								)
-							}
-						}
+					err := handler(ingressItem, ingressItem.Annotations)
+					if err != nil {
+						t.Fatalf("Ingress controller \"%s\" of \"%s\" has the wrong configuration: %v", ingressItem.Name, ingressItem.Namespace, err)
 					}
 				}
 			}
 
 			return ctx
 		}).
+		// TODO: Draft test that requires some improvements
+		// Assess("DNS is functioning properly", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		// 	totalRamGB, totalCPUCores := getDRMemCpuRequirements()
+
+		// 	t.Logf("Created %s", ctx.Value(nsKey(t)))
+		// 	podRamGB := float32(5)
+		// 	numPods := int(roundFloat(float64(totalRamGB)/float64(podRamGB), 0))
+		// 	podCPUCores := roundFloat(float64(totalCPUCores)/float64(numPods), 1)
+		// 	resource := cfg.Client().Resources()
+
+		// 	port := int32(80)
+		// 	pod, err := createDefaultPod(resource, rndString(5), ctx.Value(nsKey(t)).(string), podRamGB, float32(podCPUCores))
+		// 	if err != nil {
+		// 		t.Fatalf("Failed to create pod: %v", err)
+		// 	}
+
+		// 	podList := &corev1.PodList{Items: []corev1.Pod{*pod}}
+		// 	err = wait.For(conditions.New(resource).ResourcesMatch(podList, func(object k8s.Object) bool {
+		// 		pod := object.(*corev1.Pod)
+		// 		if pod.Status.Phase == corev1.PodRunning {
+		// 			t.Logf("Pod is ready: %s - %s - %s", pod.Namespace, pod.Name, pod.Status.Phase)
+		// 			return true
+		// 		}
+		// 		return false
+		// 	}), wait.WithImmediate(), wait.WithTimeout(5*time.Minute))
+		// 	if err != nil {
+		// 		t.Error(err)
+		// 	}
+
+		// 	service, err := createService(resource, pod, port)
+		// 	if err != nil {
+		// 		t.Error(err)
+		// 	}
+		// 	ingress, err := createIngressRouteForServiceSync(resource, service, port)
+		// 	if err != nil {
+		// 		t.Error(err)
+		// 	}
+		// 	ingressPath := ingress.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Path
+
+		// 	ingressExternalLBURL, err := getDefaultIngressExternalLBURL(cfg.Client().Resources())
+		// 	if err != nil {
+		// 		t.Fatalf("Failed to get default ingress external LoadBalancer IP: %v", err)
+		// 	}
+
+		// 	externalWsURL := fmt.Sprintf("%s%s", ingressExternalLBURL, ingressPath)
+		// 	err = checkConnectionToRootRoute(&externalWsURL)
+		// 	if err != nil {
+		// 		t.Fatalf("Can't connect to pod %s: %v", pod.Name, err)
+		// 	}
+
+		// 	return ctx
+		// }).
 		Assess("cert-manager deployment has been installed and configured", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 
 			// Check if cert-manager deployment is running
@@ -271,6 +324,18 @@ func checkConnectionToRootRoute(rootUrl *string) error {
 		resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("received bad status code %d from default ingress at URL %s", resp.StatusCode, *rootUrl)
 	}
+	return nil
+}
+
+func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations map[string]string) error {
+	for annotationName, annotationValue := range definedAnnotations {
+		if value, ok := expectedAnnotations[annotationName]; ok {
+			if value != annotationValue {
+				return fmt.Errorf("wrong annotation \"%s\", expected \"%s\", got \"%s\"", annotationName, value, annotationValue)
+			}
+		}
+	}
+
 	return nil
 }
 
