@@ -17,6 +17,16 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log"
+	"math"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -25,19 +35,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-version"
+
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	v12 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/utils/env"
-	"log"
-	"math"
-	"math/rand"
-	"net/http"
-	"net/url"
-	"os"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
@@ -45,9 +52,6 @@ import (
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
-	"strings"
-	"testing"
-	"time"
 )
 
 const BYTES_IN_GB = 1024 * 1024 * 1024
@@ -103,6 +107,203 @@ func TestNetwork(t *testing.T) {
 			if err := testWSConnection(err, &externalWsURL, t); err != nil {
 				t.Fatalf("Failed connecting to websocket server: %v", err)
 			}
+			return ctx
+		}).
+		Assess("ingress controllers have required capability", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+
+			// Ingress controllers requirements
+			var ingressRequirements = map[string]func(ingress v12.Ingress, annotations map[string]string) error{}
+			ingressRequirements["apigateway"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				return checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    "1124M",
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				})
+			}
+			ingressRequirements["core"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				return checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    "20G",
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				})
+			}
+			ingressRequirements["nbx-ingress"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				return checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				})
+			}
+			ingressRequirements["nbx-websocket"] = func(ingress v12.Ingress, annotations map[string]string) error {
+				err := checkAnnotations(annotations, map[string]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    "15m",
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+				})
+				if err != nil {
+					return err
+				}
+
+				// Check sticky sessions
+				deploymentItem, depErr := getDeployment(
+					cfg.Client().Resources(),
+					"nbx-websocket-notebooks-deployment",
+					ingress.Namespace,
+				)
+				if depErr != nil {
+					return fmt.Errorf("Failed to get the deployment: %v", depErr)
+				}
+				if int(*deploymentItem.Spec.Replicas) > 1 {
+					if _, ok := ingress.Annotations["nginx.ingress.kubernetes.io/session-cookie-name"]; !ok {
+						return fmt.Errorf(
+							"No defined sticky session with \"session-cookie-name\" annotation, but there are more than 1 replicas: %d",
+							*deploymentItem.Spec.Replicas,
+						)
+					}
+				}
+
+				return nil
+			}
+
+			ingressItems, err := getAllIngressControllers(cfg.Client().Resources())
+			if err != nil {
+				t.Fatalf("Failed to get ingress controllers: %v", err)
+				return ctx
+			}
+
+			for _, ingressItem := range *ingressItems {
+				handler, exists := ingressRequirements[ingressItem.Name]
+				if exists {
+					err := handler(ingressItem, ingressItem.Annotations)
+					if err != nil {
+						t.Fatalf("Ingress controller \"%s\" of \"%s\" has the wrong configuration: %v", ingressItem.Name, ingressItem.Namespace, err)
+					}
+				}
+			}
+
+			return ctx
+		}).
+		Assess("DNS is functioning properly", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			resource := cfg.Client().Resources()
+
+			// Is DNS service up and running?
+			serviceList := corev1.ServiceList{}
+			serviceListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.LabelSelector = fmt.Sprintf("k8s-app=%s", "kube-dns")
+			})
+			err := resource.List(context.TODO(), &serviceList, serviceListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get kube-dns service: %v", err)
+			}
+			if len(serviceList.Items) == 0 {
+				err := fmt.Errorf("no services found")
+				t.Fatalf("Failed to get kube-dns service: %v", err)
+			}
+			if serviceList.Items[0].Spec.ClusterIP == "" {
+				log.Fatalf("kube-dns service does not have a ClusterIP")
+			}
+
+			// Is DNS service pods up and running?
+			podList := corev1.PodList{}
+			podListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.LabelSelector = fmt.Sprintf("k8s-app=%s", "kube-dns")
+			})
+			err = resource.List(context.TODO(), &podList, podListOpts)
+			if err != nil {
+				t.Fatalf("Failed to create pod: %v", err)
+			}
+			if len(podList.Items) == 0 {
+				err := fmt.Errorf("no pods found")
+				t.Fatalf("Failed to get kube-dns pods: %v", err)
+			}
+			for _, podItem := range podList.Items {
+				if podItem.Status.Phase != corev1.PodRunning {
+					t.Fatalf("Detected the failed kube-dns pod: %s - %s - %s", podItem.Name, podItem.Status.Phase, podItem.Status.Message)
+				}
+				for _, containerStatus := range podItem.Status.ContainerStatuses {
+					if !containerStatus.Ready {
+						t.Fatalf("Detected unready container in kube-dns pod: %s - %s - %s", podItem.Name, containerStatus.Name, containerStatus.State)
+					}
+				}
+			}
+
+			// Are DNS endpoints exposed?
+			endpointsList := corev1.EndpointsList{}
+			endpointListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.LabelSelector = fmt.Sprintf("k8s-app=%s", "kube-dns")
+			})
+			err = resource.List(context.TODO(), &endpointsList, endpointListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get endpoints: %v", err)
+			}
+			if len(endpointsList.Items) == 0 {
+				log.Fatalf("No endpoints found for kube-dns service")
+			}
+			for _, endpointItem := range endpointsList.Items {
+				for _, subset := range endpointItem.Subsets {
+					for _, address := range subset.Addresses {
+						if address.IP == "" {
+							log.Fatalf("'%s' kube-dns endpoint does not have an IP: %s", endpointItem.Name, address.IP)
+						}
+					}
+				}
+			}
+
+			// Does CoreDNS have appropriate roles?
+			clusterRoleList := rbacv1.ClusterRoleList{}
+			clusterRoleListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.FieldSelector = fmt.Sprintf("metadata.name=%s", "system:coredns")
+			})
+			err = resource.List(context.TODO(), &clusterRoleList, clusterRoleListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get roles: %v", err)
+			}
+			if len(clusterRoleList.Items) == 0 {
+				log.Fatalf("No roles found for kube-dns service")
+			}
+
+			// Does CoreDNS have a correct role binding?
+			clusterRoleBindingList := rbacv1.ClusterRoleBindingList{}
+			clusterRoleBindingListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.FieldSelector = fmt.Sprintf("metadata.name=%s", "system:coredns")
+			})
+			err = resource.List(context.TODO(), &clusterRoleBindingList, clusterRoleBindingListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get roles: %v", err)
+			}
+			if len(clusterRoleBindingList.Items) == 0 {
+				log.Fatalf("No role bindings found for kube-dns service")
+			}
+
+			return ctx
+		}).
+		Assess("cert-manager deployment has been installed and configured", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+
+			// Check if cert-manager deployment is running
+			certManagerDeployment, err := getDeployment(cfg.Client().Resources(), "cert-manager", "cert-manager")
+			if err != nil {
+				t.Fatalf("Failed to get cert-manager deployment: %v", err)
+			}
+			err = checkCertManagerDeployment(certManagerDeployment)
+			if err != nil {
+				t.Fatalf("The cert-manager deployment is not ready: %v", err)
+			}
+
+			// Check if cert-manager-cainjector deployment is running
+			certManagerCainjectorDeployment, err := getDeployment(cfg.Client().Resources(), "cert-manager-cainjector", "cert-manager")
+			if err != nil {
+				t.Fatalf("Failed to get cert-manager-cainjector deployment: %v", err)
+			}
+			err = checkCertManagerDeployment(certManagerCainjectorDeployment)
+			if err != nil {
+				t.Fatalf("The cert-manager-cainjector deployment is not ready: %v", err)
+			}
+
+			// Check if cert-manager-webhook is running
+			certManagerWebhook, err := getDeployment(cfg.Client().Resources(), "cert-manager-webhook", "cert-manager")
+			if err != nil {
+				t.Fatalf("Failed to get cert-manager-webhook deployment: %v", err)
+			}
+			err = checkCertManagerDeployment(certManagerWebhook)
+			if err != nil {
+				t.Fatalf("The cert-manager-webhook deployment is not ready: %v", err)
+			}
+
 			return ctx
 		})
 
@@ -166,6 +367,69 @@ func checkConnectionToRootRoute(rootUrl *string) error {
 		resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("received bad status code %d from default ingress at URL %s", resp.StatusCode, *rootUrl)
 	}
+	return nil
+}
+
+func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations map[string]string) error {
+	for annotationName, annotationValue := range definedAnnotations {
+		if value, ok := expectedAnnotations[annotationName]; ok {
+			if value != annotationValue {
+				return fmt.Errorf("wrong annotation \"%s\", expected \"%s\", got \"%s\"", annotationName, value, annotationValue)
+			}
+		}
+	}
+
+	return nil
+}
+
+func getAllIngressControllers(r *resources.Resources) (*[]v12.Ingress, error) {
+	ingressList := v12.IngressList{}
+	err := r.List(context.TODO(), &ingressList)
+	if err != nil {
+		return nil, err
+	}
+	return &ingressList.Items, nil
+}
+
+func getDeployment(r *resources.Resources, name string, namespace string) (*appsv1.Deployment, error) {
+	deploymentList := appsv1.DeploymentList{}
+	t := resources.ListOption(func(opts *v1.ListOptions) {
+		opts.FieldSelector = fmt.Sprintf("metadata.name=%s,metadata.namespace=%s", name, namespace)
+	})
+	err := r.List(context.TODO(), &deploymentList, t)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(deploymentList.Items) == 0 {
+		err := fmt.Errorf("no deployments found")
+		return nil, err
+	}
+
+	return &deploymentList.Items[0], nil
+}
+
+func checkCertManagerDeployment(deployment *appsv1.Deployment) error {
+	conditions := deployment.Status.Conditions
+	failureConditions := filter(conditions, func(condition appsv1.DeploymentCondition) bool {
+		return condition.Type == appsv1.DeploymentReplicaFailure
+	})
+	if len(failureConditions) > 0 {
+		return fmt.Errorf("%s deployment has failed conditions: %v", deployment.Name, failureConditions)
+	}
+	availableConditions := filter(conditions, func(condition appsv1.DeploymentCondition) bool {
+		return condition.Type == appsv1.DeploymentAvailable
+	})
+	if len(availableConditions) == 0 {
+		return fmt.Errorf("%s deployment has not available conditions: %v", deployment.Name, availableConditions)
+	}
+	progressingConditions := filter(conditions, func(condition appsv1.DeploymentCondition) bool {
+		return condition.Type == appsv1.DeploymentProgressing
+	})
+	if len(progressingConditions) == 0 {
+		return fmt.Errorf("%s deployment has not progressing conditions: %v", deployment.Name, progressingConditions)
+	}
+
 	return nil
 }
 
