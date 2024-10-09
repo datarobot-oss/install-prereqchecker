@@ -177,58 +177,42 @@ func TestNetwork(t *testing.T) {
 
 			return ctx
 		}).
-		// TODO: Draft test that requires some improvements
-		// Assess("DNS is functioning properly", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-		// 	totalRamGB, totalCPUCores := getDRMemCpuRequirements()
+		Assess("DNS is functioning properly", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			totalRamGB, totalCPUCores := getDRMemCpuRequirements()
 
-		// 	t.Logf("Created %s", ctx.Value(nsKey(t)))
-		// 	podRamGB := float32(5)
-		// 	numPods := int(roundFloat(float64(totalRamGB)/float64(podRamGB), 0))
-		// 	podCPUCores := roundFloat(float64(totalCPUCores)/float64(numPods), 1)
-		// 	resource := cfg.Client().Resources()
+			// Resource settings
+			podRamGB := float32(5)
+			numPods := int(roundFloat(float64(totalRamGB)/float64(podRamGB), 0))
+			podCPUCores := roundFloat(float64(totalCPUCores)/float64(numPods), 1)
+			resource := cfg.Client().Resources()
 
-		// 	port := int32(80)
-		// 	pod, err := createDefaultPod(resource, rndString(5), ctx.Value(nsKey(t)).(string), podRamGB, float32(podCPUCores))
-		// 	if err != nil {
-		// 		t.Fatalf("Failed to create pod: %v", err)
-		// 	}
+			// Create a pod
+			pod, err := createDefaultPod(resource, rndString(5), ctx.Value(nsKey(t)).(string), podRamGB, float32(podCPUCores))
+			if err != nil {
+				t.Fatalf("Failed to create pod: %v", err)
+			}
+			podList := &corev1.PodList{Items: []corev1.Pod{*pod}}
+			err = wait.For(conditions.New(resource).ResourcesMatch(podList, func(object k8s.Object) bool {
+				pod := object.(*corev1.Pod)
+				if pod.Status.Phase == corev1.PodRunning {
+					t.Logf("Pod is ready: %s - %s - %s", pod.Namespace, pod.Name, pod.Status.Phase)
+					return true
+				}
+				return false
+			}), wait.WithImmediate(), wait.WithTimeout(5*time.Minute))
+			if err != nil {
+				t.Error(err)
+			}
 
-		// 	podList := &corev1.PodList{Items: []corev1.Pod{*pod}}
-		// 	err = wait.For(conditions.New(resource).ResourcesMatch(podList, func(object k8s.Object) bool {
-		// 		pod := object.(*corev1.Pod)
-		// 		if pod.Status.Phase == corev1.PodRunning {
-		// 			t.Logf("Pod is ready: %s - %s - %s", pod.Namespace, pod.Name, pod.Status.Phase)
-		// 			return true
-		// 		}
-		// 		return false
-		// 	}), wait.WithImmediate(), wait.WithTimeout(5*time.Minute))
-		// 	if err != nil {
-		// 		t.Error(err)
-		// 	}
+			// Connect to the pod
+			internalURL := fmt.Sprintf("http://%s.%s.svc.cluster.local", pod.Name, pod.Namespace)
+			err = checkConnectionToRootRoute(&internalURL)
+			if err != nil {
+				t.Fatalf("Can't connect to pod %s: %v", pod.Name, err)
+			}
 
-		// 	service, err := createService(resource, pod, port)
-		// 	if err != nil {
-		// 		t.Error(err)
-		// 	}
-		// 	ingress, err := createIngressRouteForServiceSync(resource, service, port)
-		// 	if err != nil {
-		// 		t.Error(err)
-		// 	}
-		// 	ingressPath := ingress.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Path
-
-		// 	ingressExternalLBURL, err := getDefaultIngressExternalLBURL(cfg.Client().Resources())
-		// 	if err != nil {
-		// 		t.Fatalf("Failed to get default ingress external LoadBalancer IP: %v", err)
-		// 	}
-
-		// 	externalWsURL := fmt.Sprintf("%s%s", ingressExternalLBURL, ingressPath)
-		// 	err = checkConnectionToRootRoute(&externalWsURL)
-		// 	if err != nil {
-		// 		t.Fatalf("Can't connect to pod %s: %v", pod.Name, err)
-		// 	}
-
-		// 	return ctx
-		// }).
+			return ctx
+		}).
 		Assess("cert-manager deployment has been installed and configured", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 
 			// Check if cert-manager deployment is running
