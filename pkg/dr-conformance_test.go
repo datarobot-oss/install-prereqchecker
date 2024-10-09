@@ -40,6 +40,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	v12 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
@@ -178,37 +179,95 @@ func TestNetwork(t *testing.T) {
 			return ctx
 		}).
 		Assess("DNS is functioning properly", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			totalRamGB, totalCPUCores := getDRMemCpuRequirements()
-
-			// Resource settings
-			podRamGB := float32(5)
-			numPods := int(roundFloat(float64(totalRamGB)/float64(podRamGB), 0))
-			podCPUCores := roundFloat(float64(totalCPUCores)/float64(numPods), 1)
 			resource := cfg.Client().Resources()
 
-			// Create a pod
-			pod, err := createDefaultPod(resource, rndString(5), ctx.Value(nsKey(t)).(string), podRamGB, float32(podCPUCores))
+			// Is DNS service up and running?
+			serviceList := corev1.ServiceList{}
+			serviceListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.LabelSelector = fmt.Sprintf("k8s-app=%s", "kube-dns")
+			})
+			err := resource.List(context.TODO(), &serviceList, serviceListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get kube-dns service: %v", err)
+			}
+			if len(serviceList.Items) == 0 {
+				err := fmt.Errorf("no services found")
+				t.Fatalf("Failed to get kube-dns service: %v", err)
+			}
+			if serviceList.Items[0].Spec.ClusterIP == "" {
+				log.Fatalf("kube-dns service does not have a ClusterIP")
+			}
+
+			// Is DNS service pods up and running?
+			podList := corev1.PodList{}
+			podListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.LabelSelector = fmt.Sprintf("k8s-app=%s", "kube-dns")
+			})
+			err = resource.List(context.TODO(), &podList, podListOpts)
 			if err != nil {
 				t.Fatalf("Failed to create pod: %v", err)
 			}
-			podList := &corev1.PodList{Items: []corev1.Pod{*pod}}
-			err = wait.For(conditions.New(resource).ResourcesMatch(podList, func(object k8s.Object) bool {
-				pod := object.(*corev1.Pod)
-				if pod.Status.Phase == corev1.PodRunning {
-					t.Logf("Pod is ready: %s - %s - %s", pod.Namespace, pod.Name, pod.Status.Phase)
-					return true
+			if len(podList.Items) == 0 {
+				err := fmt.Errorf("no pods found")
+				t.Fatalf("Failed to get kube-dns pods: %v", err)
+			}
+			for _, podItem := range podList.Items {
+				if podItem.Status.Phase != corev1.PodRunning {
+					t.Fatalf("Detected the failed kube-dns pod: %s - %s - %s", podItem.Name, podItem.Status.Phase, podItem.Status.Message)
 				}
-				return false
-			}), wait.WithImmediate(), wait.WithTimeout(5*time.Minute))
-			if err != nil {
-				t.Error(err)
+				for _, containerStatus := range podItem.Status.ContainerStatuses {
+					if !containerStatus.Ready {
+						t.Fatalf("Detected unready container in kube-dns pod: %s - %s - %s", podItem.Name, containerStatus.Name, containerStatus.State)
+					}
+				}
 			}
 
-			// Connect to the pod
-			internalURL := fmt.Sprintf("http://%s.%s.svc.cluster.local", pod.Name, pod.Namespace)
-			err = checkConnectionToRootRoute(&internalURL)
+			// Are DNS endpoints exposed?
+			endpointsList := corev1.EndpointsList{}
+			endpointListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.LabelSelector = fmt.Sprintf("k8s-app=%s", "kube-dns")
+			})
+			err = resource.List(context.TODO(), &endpointsList, endpointListOpts)
 			if err != nil {
-				t.Fatalf("Can't connect to pod %s: %v", pod.Name, err)
+				t.Fatalf("Failed to get endpoints: %v", err)
+			}
+			if len(endpointsList.Items) == 0 {
+				log.Fatalf("No endpoints found for kube-dns service")
+			}
+			for _, endpointItem := range endpointsList.Items {
+				for _, subset := range endpointItem.Subsets {
+					for _, address := range subset.Addresses {
+						if address.IP == "" {
+							log.Fatalf("'%s' kube-dns endpoint does not have an IP: %s", endpointItem.Name, address.IP)
+						}
+					}
+				}
+			}
+
+			// Does CoreDNS have appropriate roles?
+			clusterRoleList := rbacv1.ClusterRoleList{}
+			clusterRoleListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.FieldSelector = fmt.Sprintf("metadata.name=%s", "system:coredns")
+			})
+			err = resource.List(context.TODO(), &clusterRoleList, clusterRoleListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get roles: %v", err)
+			}
+			if len(clusterRoleList.Items) == 0 {
+				log.Fatalf("No roles found for kube-dns service")
+			}
+
+			// Does CoreDNS have a correct role binding?
+			clusterRoleBindingList := rbacv1.ClusterRoleBindingList{}
+			clusterRoleBindingListOpts := resources.ListOption(func(opts *v1.ListOptions) {
+				opts.FieldSelector = fmt.Sprintf("metadata.name=%s", "system:coredns")
+			})
+			err = resource.List(context.TODO(), &clusterRoleBindingList, clusterRoleBindingListOpts)
+			if err != nil {
+				t.Fatalf("Failed to get roles: %v", err)
+			}
+			if len(clusterRoleBindingList.Items) == 0 {
+				log.Fatalf("No role bindings found for kube-dns service")
 			}
 
 			return ctx
