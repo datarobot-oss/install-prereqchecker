@@ -8,7 +8,7 @@ spec:
   command:
     - bash
   args: [ "-c","go tool test2json ./dr-conformance.test -test.v | tee ${SONOBUOY_RESULTS_DIR}/out.json ; echo ${SONOBUOY_RESULTS_DIR}/out.json > ${SONOBUOY_RESULTS_DIR}/done" ]
-  image: datarobot/install-prereqchecker:latest
+  image: ghcr.io/datarobot-oss/install-prereqchecker:latest
   env:
     - name: MIN_K8S_VERSION
       value: "1.23"
