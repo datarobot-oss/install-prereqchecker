@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-REGISTRY=datarobot
+REGISTRY=ghcr.io/datarobot-oss
 IMG=install-prereqchecker
 TAG=latest
 
