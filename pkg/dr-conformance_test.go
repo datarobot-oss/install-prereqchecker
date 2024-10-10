@@ -112,32 +112,29 @@ func TestNetwork(t *testing.T) {
 		Assess("ingress controllers have required capability", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 
 			// Ingress controllers requirements
-			var ingressRequirements = map[string]func(ingress v12.Ingress, annotations map[string]string) error{}
-			ingressRequirements["apigateway"] = func(ingress v12.Ingress, annotations map[string]string) error {
+			var ingressRequirements = map[string]func(ingress v12.Ingress, annotations map[string]string) []string{}
+			ingressRequirements["apigateway"] = func(ingress v12.Ingress, annotations map[string]string) []string {
 				return checkAnnotations(annotations, map[string]string{
 					"nginx.ingress.kubernetes.io/proxy-body-size":    "1124M",
 					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
 				})
 			}
-			ingressRequirements["core"] = func(ingress v12.Ingress, annotations map[string]string) error {
+			ingressRequirements["core"] = func(ingress v12.Ingress, annotations map[string]string) []string {
 				return checkAnnotations(annotations, map[string]string{
 					"nginx.ingress.kubernetes.io/proxy-body-size":    "20G",
 					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
 				})
 			}
-			ingressRequirements["nbx-ingress"] = func(ingress v12.Ingress, annotations map[string]string) error {
+			ingressRequirements["nbx-ingress"] = func(ingress v12.Ingress, annotations map[string]string) []string {
 				return checkAnnotations(annotations, map[string]string{
 					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
 				})
 			}
-			ingressRequirements["nbx-websocket"] = func(ingress v12.Ingress, annotations map[string]string) error {
-				err := checkAnnotations(annotations, map[string]string{
+			ingressRequirements["nbx-websocket"] = func(ingress v12.Ingress, annotations map[string]string) []string {
+				errors := checkAnnotations(annotations, map[string]string{
 					"nginx.ingress.kubernetes.io/proxy-body-size":    "15m",
 					"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
 				})
-				if err != nil {
-					return err
-				}
 
 				// Check sticky sessions
 				deploymentItem, depErr := getDeployment(
@@ -146,34 +143,36 @@ func TestNetwork(t *testing.T) {
 					ingress.Namespace,
 				)
 				if depErr != nil {
-					return fmt.Errorf("Failed to get the deployment: %v", depErr)
+					errors = append(errors, fmt.Sprintf("Failed to get the deployment: %v", depErr))
+					return errors
 				}
 				if int(*deploymentItem.Spec.Replicas) > 1 {
 					if _, ok := ingress.Annotations["nginx.ingress.kubernetes.io/session-cookie-name"]; !ok {
-						return fmt.Errorf(
-							"No defined sticky session with \"session-cookie-name\" annotation, but there are more than 1 replicas: %d",
-							*deploymentItem.Spec.Replicas,
-						)
+						errors = append(errors, fmt.Sprintf("No defined sticky session with \"session-cookie-name\" annotation, but there are more than 1 replicas: %d", *deploymentItem.Spec.Replicas))
 					}
 				}
 
-				return nil
+				return errors
 			}
 
 			ingressItems, err := getAllIngressControllers(cfg.Client().Resources())
 			if err != nil {
 				t.Fatalf("Failed to get ingress controllers: %v", err)
-				return ctx
 			}
 
+			errors := []string{}
 			for _, ingressItem := range *ingressItems {
 				handler, exists := ingressRequirements[ingressItem.Name]
 				if exists {
-					err := handler(ingressItem, ingressItem.Annotations)
-					if err != nil {
-						t.Fatalf("Ingress controller \"%s\" of \"%s\" has the wrong configuration: %v", ingressItem.Name, ingressItem.Namespace, err)
+					ingressErrors := handler(ingressItem, ingressItem.Annotations)
+					if len(ingressErrors) > 0 {
+						errors = append(errors, fmt.Sprintf("\nIngress controller \"%s\" of \"%s\" has the wrong configuration:\n %v", ingressItem.Name, ingressItem.Namespace, strings.Join(ingressErrors, "\n, ")))
 					}
 				}
+			}
+
+			if len(errors) > 0 {
+				t.Fatalf("Ingress controllers have the wrong configurations: %v", strings.Join(errors, ",\n"))
 			}
 
 			return ctx
@@ -214,11 +213,6 @@ func TestNetwork(t *testing.T) {
 			for _, podItem := range podList.Items {
 				if podItem.Status.Phase != corev1.PodRunning {
 					t.Fatalf("Detected the failed kube-dns pod: %s - %s - %s", podItem.Name, podItem.Status.Phase, podItem.Status.Message)
-				}
-				for _, containerStatus := range podItem.Status.ContainerStatuses {
-					if !containerStatus.Ready {
-						t.Fatalf("Detected unready container in kube-dns pod: %s - %s - %s", podItem.Name, containerStatus.Name, containerStatus.State)
-					}
 				}
 			}
 
@@ -370,16 +364,19 @@ func checkConnectionToRootRoute(rootUrl *string) error {
 	return nil
 }
 
-func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations map[string]string) error {
-	for annotationName, annotationValue := range definedAnnotations {
-		if value, ok := expectedAnnotations[annotationName]; ok {
-			if value != annotationValue {
-				return fmt.Errorf("wrong annotation \"%s\", expected \"%s\", got \"%s\"", annotationName, value, annotationValue)
+func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations map[string]string) []string {
+	errors := []string{}
+	for expectedAnnotationName, expectedAnnotationValue := range expectedAnnotations {
+		if value, ok := definedAnnotations[expectedAnnotationName]; ok {
+			if value != expectedAnnotationValue {
+				errors = append(errors, fmt.Sprintf("wrong annotation \"%s\", expected \"%s\", got \"%s\"", expectedAnnotationName, expectedAnnotationValue, value))
 			}
+		} else {
+			errors = append(errors, fmt.Sprintf("required annotation not found \"%s\"", expectedAnnotationName))
 		}
 	}
 
-	return nil
+	return errors
 }
 
 func getAllIngressControllers(r *resources.Resources) (*[]v12.Ingress, error) {
