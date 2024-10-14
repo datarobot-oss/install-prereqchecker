@@ -2,18 +2,18 @@
 
 install-prereqcheker is a CLI tool to verify target installation environment conformance with DataRobot requirements. It is meant to be an open-source self service tool accessible for anyone including customers. The idea is that before DataRobot is installed a support team member or a customer can run a tool which will analyze their target environment to check if it meets the pre-requisites for installing DataRobot.
 
-# Quick start
+## How it works
 
-install-prereqchecker is a plugin for a third party tool called [Sonobuoy](https://sonobuoy.io/) which is used for Kubernetes conformance testing.
+### Install sonobuoy
 
-## Install sonobuoy
+install-prereqchecker is implemented as a plugin for a third party tool called [Sonobuoy](https://sonobuoy.io/) which is used for Kubernetes conformance testing.
 
-### Mac
+#### Mac
 ```
 brew install sonobuoy
 ```
 
-### Linux
+#### Linux
 
 
 1. Download Sonobuoy tarball
@@ -32,7 +32,7 @@ tar -xvf <RELEASE_TARBALL_NAME>.tar.gz
 sudo cp sonobuoy /usr/local/bin
 ```
 
-### Run it
+### Run tests
 
 To run the `install-prereqchecker` execute. 
 ```
@@ -44,11 +44,17 @@ sonobuoy run --plugin "https://raw.githubusercontent.com/datarobot/install-prere
 --plugin-env datarobot-conformance.K8S_ENVIRONMENT=EKS
 ```
 
+Note: To avoid permission issues use `--kubeconfig` flag, more parameters can be found in the official documentation ([here](https://sonobuoy.io/docs/v0.56.15/cli/sonobuoy_run/) and [here](https://sonobuoy.io/understanding-e2e-tests/)).
+
 This will run a series of tests that are specific to DataRobot to verify that DataRobot will have the required resources to run properly. 
 Set `--plugin-env datarobot-conformance.K8S_ENVIRONMENT` to the proper Kubernetes environment.
 The default is `on-prem`. You can find all the latest available options [here](https://github.com/datarobot/install-prereqchecker/blob/main/pkg/main_test.go)
 
-Watch it
+
+### Check status and logs
+
+To verify the current status:
+
 ```
 sonobuoy status
 ```
@@ -59,27 +65,108 @@ When it finishes, you will see:
    datarobot-conformance   complete   failed       1   Passed:  2, Failed:  4
 ```
 
-Retrieve the results and delete the sonobuoy namespace. Gather the tar.gz file and provide the results to the Enterprise Deployment Team.
+To check logs quickly perform:
+
 ```
-sonobuoy retrieve 
-kubectl delete ns sonobuoy
+sonobuoy logs
 ```
 
-The downloaded tarball will contain everything you need. Look at `plugins/datarobot-conformance/sonobuoy_results.yaml` for a summary of the results
+### Get results
 
-# What and how it tests
+To retrieve the results use the following command, where `output` is a directory for logs
+
+```
+sonobuoy retrieve -x output
+```
+
+To compress results to an arhive use `-f` flag:
+
+```
+sonobuoy retrieve -f file.tar.gz
+```
+
+The results have the following file structure:
+
+```
+output/
+├── hosts/
+├── meta/                       – The meta data of the cluster.
+├── plugins/                    
+|   ├── datarobot-conformance/  - The plugin directory.
+|   |   └── results/
+|   |       └── global/
+|   |           └── out.json    - The file of results that includes test statuses and error messages.
+|   ├── definition.json         - The cluster configs that are defined for tests.
+|   └── sonobuoy_results.yaml   - The main file of results that includes the base status only.
+├── podlogs/                    - logs of pods and Sonobuoy collector.
+└── resources/
+```
+
+### Delete a sonobuoy assets 
+
+To delete the sonobuoy stuff: 
+
+```
+sonobuoy delete --all --wait
+```
+
+Also, the following command can delete a sonobuoy namespace:
+
+```
+kubectl delete ns sonobuoy-01
+```
+
+## What and how it tests
 
 `sonobuoy` is just a wrapper tool to spin up a driver container, run tests and grab results. DataRobot conformance tests are standard Go tests built on top of sonoboy, open source end to end Kubernetes testing framework. The test are open sourced as well for anyone to review. We started with a few tests and will continue to add new ones over time based on requirements and feedback. Customer contributions to the tests are also welcome. 
 
-|Test|What it does|Notes|
-|-|-|-|
-|`TestNetwork`<br>`/network/network_has_enough_free_IPs`| Verifies that there is enough free IPs to install DataRobot|Assumes DataRobot needs 80 (pods) + 50 (services) IPs. Specific to AWS and non-AWS. For AWS grabs subnets assigned to a cluster and checks free IP number. For non-AWS gets number of Nodes, multiples by 254 and substract total number of pods and services|
-|`TestNetwork`<br>`/network/ingress_correctly_configured`| Verifies there’s a functioning default Ingress controller with external LoadBalancer accessible by its external IP/hostname | There’s no direct way to match Service for Ingress to its IngressClass in k8s, we are using fuzzy-name search, i.e. we are looking up a service which has IngressClass substring in its name. This is not very reliable and might cause problems (i.e. if you manually create a service and call it “nginx”)|
-|`TestNetwork`<br>`/network/websockets_are_allowed_through_ingress` | Verifies websocket connections are working through the external Ingress LoadBalancer||
-|`TestCanAccessBlobStorage`<br>`/external_services/can_access_blob_storage`|Verifies BLOB storage is accessible from pods|Specific cloud environment. For AWS uses IRSA and expects Pods to be able to do `aws s3 ls`|
-|`TestCanRunPrivilegedContainers`<br>`/privileged_containers/can_run_privileged_containers`|Verifies a privileged container can be run||
-|`TestK8sVersion`<br>`/cluster_version/is_greater_than_minimum_supported_version`|Verifies Kubernetes is at given version or higher|use MIN_K8S_VERSION environment variable to specify desired version|
-|`TestClusterHasEnoughResourcesStatic`<br>`/worker_nodes/have_enough_resources`|Verifies Kubernetes cluster has enough CPU and RAM to run DataRobot|Assumes DataRobot needs at least 150GB of RAM and 18 CPU. Computes a sum of allocatable CPU and RAM on all nodes|
-|`TestClusterHasEnoughResourcesByPodCreation`<br>`/available_resources/cluster_can_run_pods_with_enough_resources`|Assumes DataRobot needs at least 150GB of RAM and 18 CPU. Tries to start a number of containers each requiring 5 GB of RAM and 1 CPU and watching them all successfully scheduling||
+|Test file name|Description|
+|-|-|
+|`pkg/main_test.go`| Setup the base environment that includes a separate namespace cluster settings.|
+|`pkg/dr-conformance_test.go`| All tests that cover the following aspects: `network`, `external services`, `privileged containers`, `cluster version`, `worker nodes`, `available resources`|
 
 
+## How to add the new tests
+
+### Install Go dependencies
+
+To install Go packages:
+
+```
+make install-deps
+```
+
+The local running requires environment variables to connect to Kubernetes cluster:
+
+```
+export CLUSTER_NAME="ci-drcore-ue1-02"
+export K8S_ENVIRONMENT=EKS
+export AWS_REGION=us-east-1
+```
+
+To execute tests from the local machine:
+
+```
+make run-tests
+```
+
+To build and push a docker image:
+
+```
+docker build --platform linux/amd64 -t ghcr.io/datarobot-oss/install-prereqchecker:latest .
+docker push ghcr.io/datarobot-oss/install-prereqchecker:latest
+```
+
+Note: Pay attention on `ghcr.io/datarobot-oss/install-prereqchecker:latest`, it can be replaced with your public repository for the manual testing with Sonobuoy.
+
+To execute tests with Sonobuoy and an own docket image use the following command, where `--plugin-image` overrides a docker image for the plugin:
+
+```
+sonobuoy run --plugin "./plugin.yaml" \
+--plugin-env datarobot-conformance.CLUSTER_NAME=<your-cluster-name> \
+--plugin-env datarobot-conformance.AWS_REGION=us-east-1 \
+--force-image-pull-policy \
+--image-pull-policy=Always \
+--plugin-env datarobot-conformance.K8S_ENVIRONMENT=EKS \
+--plugin-image datarobot-conformance:datarobot/install-prereqchecker:latest
+```
