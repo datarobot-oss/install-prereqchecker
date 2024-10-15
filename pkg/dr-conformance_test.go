@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -114,26 +116,26 @@ func TestNetwork(t *testing.T) {
 			// Ingress controllers requirements
 			var ingressRequirements = map[string]func(ingress v12.Ingress, annotations map[string]string) []string{}
 			ingressRequirements["apigateway"] = func(ingress v12.Ingress, annotations map[string]string) []string {
-				return checkAnnotations(annotations, map[string]string{
-					"nginx.ingress.kubernetes.io/proxy-body-size":    "1124M",
-					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				return checkAnnotations(annotations, map[string][]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    memoryUnit("1124M"),
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": timeUnit("600s"),
 				})
 			}
 			ingressRequirements["core"] = func(ingress v12.Ingress, annotations map[string]string) []string {
-				return checkAnnotations(annotations, map[string]string{
-					"nginx.ingress.kubernetes.io/proxy-body-size":    "20G",
-					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				return checkAnnotations(annotations, map[string][]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    memoryUnit("20G"),
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": timeUnit("600s"),
 				})
 			}
 			ingressRequirements["nbx-ingress"] = func(ingress v12.Ingress, annotations map[string]string) []string {
-				return checkAnnotations(annotations, map[string]string{
-					"nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+				return checkAnnotations(annotations, map[string][]string{
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": timeUnit("600s"),
 				})
 			}
 			ingressRequirements["nbx-websocket"] = func(ingress v12.Ingress, annotations map[string]string) []string {
-				errors := checkAnnotations(annotations, map[string]string{
-					"nginx.ingress.kubernetes.io/proxy-body-size":    "15m",
-					"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+				errors := checkAnnotations(annotations, map[string][]string{
+					"nginx.ingress.kubernetes.io/proxy-body-size":    memoryUnit("15M"),
+					"nginx.ingress.kubernetes.io/proxy-read-timeout": timeUnit("3600s"),
 				})
 
 				// Check sticky sessions
@@ -364,12 +366,12 @@ func checkConnectionToRootRoute(rootUrl *string) error {
 	return nil
 }
 
-func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations map[string]string) []string {
+func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations map[string][]string) []string {
 	errors := []string{}
-	for expectedAnnotationName, expectedAnnotationValue := range expectedAnnotations {
+	for expectedAnnotationName, expectedAnnotationValues := range expectedAnnotations {
 		if value, ok := definedAnnotations[expectedAnnotationName]; ok {
-			if value != expectedAnnotationValue {
-				errors = append(errors, fmt.Sprintf("wrong annotation \"%s\", expected \"%s\", got \"%s\"", expectedAnnotationName, expectedAnnotationValue, value))
+			if !slices.Contains(expectedAnnotationValues, value) {
+				errors = append(errors, fmt.Sprintf("wrong annotation \"%s\", expected one of \"%s\", got \"%s\"", expectedAnnotationName, expectedAnnotationValues, value))
 			}
 		} else {
 			errors = append(errors, fmt.Sprintf("required annotation not found \"%s\"", expectedAnnotationName))
@@ -377,6 +379,43 @@ func checkAnnotations(definedAnnotations map[string]string, expectedAnnotations 
 	}
 
 	return errors
+}
+
+func annotationUnit(valuePlusUnit string, mapOfUnits map[string]int) []string {
+	value, err := strconv.ParseInt(valuePlusUnit[:len(valuePlusUnit)-1], 10, 32)
+	if err != nil {
+		log.Fatalf("Can't parse value %s", valuePlusUnit)
+	}
+	unit := valuePlusUnit[len(valuePlusUnit)-1:]
+	rawValue := value * int64(mapOfUnits[unit])
+	var strArray []string
+	for itemUnit, itemMultiplier := range mapOfUnits {
+		if rawValue%int64(itemMultiplier) == 0 {
+			strArray = append(strArray, fmt.Sprintf("%d%s", rawValue/int64(itemMultiplier), itemUnit))
+		}
+	}
+
+	return strArray
+}
+
+func memoryUnit(valuePlusUnit string) []string {
+	mapOfUnits := map[string]int{
+		"K": 1024,
+		"M": 1024 * 1024,
+		"G": 1024 * 1024 * 1024,
+		"T": 1024 * 1024 * 1024 * 1024,
+	}
+	return annotationUnit(valuePlusUnit, mapOfUnits)
+}
+
+func timeUnit(valuePlusUnit string) []string {
+	mapOfUnits := map[string]int{
+		"s": 1,
+		"m": 60,
+		"h": 60 * 60,
+		"d": 60 * 60 * 24,
+	}
+	return annotationUnit(valuePlusUnit, mapOfUnits)
 }
 
 func getAllIngressControllers(r *resources.Resources) (*[]v12.Ingress, error) {
